@@ -1,0 +1,125 @@
+name: Playwright Tests
+on:
+  pull_request:
+    branches: [ main ]
+    types:
+      - opened
+      - reopened
+      - synchronize
+      - closed
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+
+jobs:
+  setup:
+    name: Setup
+    timeout-minutes: 1
+    runs-on: ubuntu-latest
+    outputs:
+      branch: ${{ steps.branch_name.outputs.current_branch }}
+    steps:
+    - name: Get branch name
+      id: branch_name
+      uses: tj-actions/branch-names@v8
+
+  create_neon_branch_and_run_tests:
+    name: Create Neon Branch and Run Tests
+    needs: setup
+    permissions:
+      contents: read
+      pull-requests: write
+    if: |
+      github.event_name == 'pull_request' && (
+      github.event.action == 'synchronize' || github.event.action == 'opened' || github.event.action == 'reopened')
+    runs-on: ubuntu-latest
+    steps:
+
+      - name: Create Neon Branch
+        id: create_neon_branch
+        uses: neondatabase/create-branch-action@v6
+        with:
+          project_id: ${{ vars.NEON_PROJECT_ID }}
+          branch_name: preview/pr-${{ github.event.number }}-${{ needs.setup.outputs.branch }}
+          api_key: ${{ secrets.NEON_API_KEY }}
+          role: neondb_owner
+
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install Playwright Browsers
+        run: npx playwright install --with-deps
+
+      - name: Generate drizzle migrations
+        run: npm run db:generate
+
+      - name: Apply drizzle migrations
+        run: npm run db:migrate
+        env:
+          DATABASE_URL: '${{ steps.create_neon_branch.outputs.db_url_pooled }}'
+
+      - name: Build Next.js app
+        run: npm run build
+        env:
+          NODE_ENV: production
+          DATABASE_URL: '${{ steps.create_neon_branch.outputs.db_url_pooled }}'
+
+      - name: Start Next.js app
+        run: npm start &
+        env:
+          NODE_ENV: production
+          DATABASE_URL: '${{ steps.create_neon_branch.outputs.db_url_pooled }}'
+
+      - name: Wait for app to be ready
+        run: |
+          timeout 60 bash -c 'until curl -f http://localhost:3000 > /dev/null 2>&1; do sleep 1; done'
+
+      - name: Run Playwright tests
+        run: npm run test:e2e
+
+      - uses: actions/upload-artifact@v4
+        if: ${{ !cancelled() }}
+        with:
+          name: playwright-report
+          path: playwright-report/
+          retention-days: 30
+
+      - name: Post Schema Diff Comment to PR
+        uses: neondatabase/schema-diff-action@v1
+        with:
+          project_id: ${{ vars.NEON_PROJECT_ID }}
+          compare_branch: preview/pr-${{ github.event.number }}-${{ needs.setup.outputs.branch }}
+          api_key: ${{ secrets.NEON_API_KEY }}
+
+  delete_neon_branch:
+    name: Delete Neon Branch and Apply Migrations on Production branch
+    needs: setup
+    if: github.event_name == 'pull_request' && github.event.action == 'closed'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Delete Neon Branch
+        uses: neondatabase/delete-branch-action@v3
+        with:
+          project_id: ${{ vars.NEON_PROJECT_ID }}
+          branch: preview/pr-${{ github.event.number }}-${{ needs.setup.outputs.branch }}
+          api_key: ${{ secrets.NEON_API_KEY }}
+
+      - name: Checkout
+        if: github.event.pull_request.merged == true
+        uses: actions/checkout@v4
+
+      - name: Apply migrations to production
+        if: github.event.pull_request.merged == true
+        run: |
+          npm install
+          npm run db:generate
+          npm run db:migrate
+        env:
+          DATABASE_URL: '${{ secrets.DATABASE_URL }}'
+
